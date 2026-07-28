@@ -1,0 +1,48 @@
+name: Grimaldi cabin watch
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub may delay scheduled runs under load,
+    # so treat this as "roughly every 30-45 min", not a guarantee.
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}   # lets you trigger a check by hand, incl. from the GitHub mobile app
+
+concurrency:
+  group: cabin-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      ROUTE: ITCAG-ITNAP        # Cagliari -> Napoli
+      DATE: '06092026'          # ddmmyyyy
+      DAY_LABEL: '6 SET'        # label on the result card
+      ADULTS: '2'
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Check cabin availability
+        run: node check.js
+
+      - name: Upload screenshot if the run failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-screenshot
+          path: failure.png
+          if-no-files-found: ignore
