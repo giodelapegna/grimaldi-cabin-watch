@@ -60,18 +60,27 @@ async function snap(page, name) {
   }
 }
 
-/** Wait until the page text matches `re`. Returns true/false, never throws. */
+/**
+ * Wait until the page text matches `re`. Returns true/false, never throws.
+ *
+ * Polls with a fresh evaluate each time rather than page.waitForFunction:
+ * when the site navigates (which is exactly what we are waiting for), the
+ * injected function's execution context is destroyed and waitForFunction
+ * rejects — which previously looked like a failure even though the target
+ * page had in fact loaded. Errors mid-poll are ignored and retried.
+ */
 async function waitForText(page, re, timeout = 30000) {
-  try {
-    await page.waitForFunction(
-      (src) => new RegExp(src[0], src[1]).test(document.body.innerText),
-      [re.source, re.flags],
-      { timeout, polling: 750 }
-    );
-    return true;
-  } catch {
-    return false;
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      const txt = await page.evaluate(() => document.body.innerText);
+      if (re.test(txt)) return true;
+    } catch {
+      // Navigation in flight — the context vanished. Wait and look again.
+    }
+    await page.waitForTimeout(750).catch(() => {});
   }
+  return false;
 }
 
 /** Close cookie banners, the Grimaldi Club promo, and "Attention" dialogs. */
