@@ -1,0 +1,17 @@
+{
+  "name": "grimaldi-cabin-watch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Watches a Grimaldi Lines sailing and alerts when a cabin becomes bookable.",
+  "main": "check.js",
+  "scripts": {
+    "check": "node check.js",
+    "check:visible": "HEADLESS=false node check.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
