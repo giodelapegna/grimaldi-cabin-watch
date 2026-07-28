@@ -5,7 +5,7 @@ on:
     # Every 30 minutes. GitHub may delay scheduled runs under load,
     # so treat this as "roughly every 30-45 min", not a guarantee.
     - cron: '*/30 * * * *'
-  workflow_dispatch: {}   # lets you trigger a check by hand, incl. from the GitHub mobile app
+  workflow_dispatch: {}   # lets you trigger a check by hand
 
 concurrency:
   group: cabin-watch
@@ -21,6 +21,9 @@ jobs:
       DATE: '06092026'          # ddmmyyyy
       DAY_LABEL: '6 SET'        # label on the result card
       ADULTS: '2'
+      # Keep this 'false'. GitHub emails you when a run fails, so there is no
+      # need to also buzz your phone every 30 minutes while something is broken.
+      ALERT_ON_FAILURE: 'false'
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -39,10 +42,11 @@ jobs:
       - name: Check cabin availability
         run: node check.js
 
-      - name: Upload screenshot if the run failed
-        if: failure()
+      - name: Upload debug snapshots
+        if: always()          # uploaded on success too, so we can verify the flow
         uses: actions/upload-artifact@v4
         with:
-          name: failure-screenshot
-          path: failure.png
+          name: debug-snapshots
+          path: debug/
           if-no-files-found: ignore
+          retention-days: 7
