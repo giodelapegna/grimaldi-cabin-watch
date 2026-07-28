@@ -1,69 +1,137 @@
 /**
- * Grimaldi Lines cabin watcher.
+ * Grimaldi Lines cabin watcher (v2).
  *
- * Replays the booking flow for a single sailing and reports which
- * "sistemazioni" (accommodations) are currently offered. Alerts via
- * Telegram when a cabin appears.
+ * Replays the booking flow for one sailing and reports which "sistemazioni"
+ * (accommodations) are offered. Alerts via Telegram when a cabin appears.
  *
- * Config comes from environment variables (see .github/workflows/).
+ * v2 changes:
+ *  - Waits for each page to actually arrive instead of assuming clicks worked,
+ *    so it fails at the real point of breakage with a useful message.
+ *  - Saves a screenshot + page text at every stage into ./debug for diagnosis.
+ *  - Failure alerts are off by default (GitHub emails you about failed runs),
+ *    so a broken watcher can't spam your phone every 30 minutes.
  */
 
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 
-const ROUTE = process.env.ROUTE || 'ITCAG-ITNAP';        // Cagliari -> Napoli
-const DATE = process.env.DATE || '06092026';             // ddmmyyyy, used in the URL
-const DAY_LABEL = process.env.DAY_LABEL || '6 SET';      // how the card is labelled in results
+const ROUTE = process.env.ROUTE || 'ITCAG-ITNAP';
+const DATE = process.env.DATE || '06092026';
+const DAY_LABEL = process.env.DAY_LABEL || '6 SET';
 const ADULTS = process.env.ADULTS || '2';
 const HEADLESS = process.env.HEADLESS !== 'false';
+const ALERT_ON_FAILURE = process.env.ALERT_ON_FAILURE === 'true';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const URL = `https://booking.grimaldi-lines.com/?l=it&c=GRI&l1=${ROUTE}&d1=${DATE}`;
+const DEBUG_DIR = path.join(process.cwd(), 'debug');
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 async function notify(text) {
   if (!BOT_TOKEN || !CHAT_ID) {
-    log('WARN: Telegram not configured, printing instead:\n' + text);
+    log('WARN: Telegram not configured. Message would have been:\n' + text);
     return;
   }
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: 'HTML' }),
-  });
-  if (!res.ok) log('Telegram send failed:', res.status, await res.text());
-  else log('Telegram alert sent.');
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: 'HTML' }),
+    });
+    log(res.ok ? 'Telegram alert sent.' : `Telegram failed: ${res.status} ${await res.text()}`);
+  } catch (e) {
+    log('Telegram error:', e.message);
+  }
 }
 
-/** Click the first visible element whose text matches `re`. */
-async function clickByText(page, selector, re, { timeout = 20000 } = {}) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const handles = await page.$$(selector);
-    for (const h of handles) {
-      const txt = ((await h.evaluate(e => e.value || e.textContent || '')) || '').trim();
-      if (re.test(txt) && (await h.isVisible().catch(() => false))) {
-        await h.click({ timeout: 5000 }).catch(() => {});
-        return true;
+/** Screenshot + page text for one stage, so failures are diagnosable. */
+async function snap(page, name) {
+  try {
+    fs.mkdirSync(DEBUG_DIR, { recursive: true });
+    await page.screenshot({ path: path.join(DEBUG_DIR, `${name}.png`), fullPage: true });
+    const txt = await page.evaluate(() => document.body.innerText);
+    fs.writeFileSync(path.join(DEBUG_DIR, `${name}.txt`), txt);
+  } catch (e) {
+    log(`(could not save debug snapshot ${name}: ${e.message})`);
+  }
+}
+
+/** Wait until the page text matches `re`. Returns true/false, never throws. */
+async function waitForText(page, re, timeout = 30000) {
+  try {
+    await page.waitForFunction(
+      (src) => new RegExp(src[0], src[1]).test(document.body.innerText),
+      [re.source, re.flags],
+      { timeout, polling: 750 }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Close cookie banners, the Grimaldi Club promo, and "Attention" dialogs. */
+async function dismissOverlays(page) {
+  const patterns = [
+    /continua come ospite/i,
+    /^\s*(close|chiudi)\s*$/i,
+    /(accetta|rifiuta|accept|reject)/i,
+  ];
+  for (const re of patterns) {
+    const el = page.locator('a, button, input[type=button]').filter({ hasText: re }).first();
+    if (await el.count().catch(() => 0)) {
+      if (await el.isVisible().catch(() => false)) {
+        await el.click({ timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(1200);
       }
     }
-    await page.waitForTimeout(500);
+  }
+}
+
+/** Click the first visible match, using real mouse events. */
+async function clickText(page, selector, re, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const items = page.locator(selector).filter({ hasText: re });
+    const n = await items.count().catch(() => 0);
+    for (let i = 0; i < n; i++) {
+      const el = items.nth(i);
+      if (await el.isVisible().catch(() => false)) {
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        if (await el.click({ timeout: 5000 }).then(() => true).catch(() => false)) return true;
+      }
+    }
+    await page.waitForTimeout(600);
   }
   return false;
 }
 
-/** Close cookie banners / promo modals that block the flow. */
-async function dismissOverlays(page) {
-  await clickByText(page, 'button, a', /continua come ospite/i, { timeout: 3000 });
-  await clickByText(page, 'button', /^(close|chiudi|rifiuta|accetta)/i, { timeout: 3000 });
+/** Same, but for <input type=submit/button> whose label lives in `value`. */
+async function clickInput(page, re, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const handles = await page.$$('input[type=submit], input[type=button], button');
+    for (const h of handles) {
+      const label = ((await h.evaluate(e => e.value || e.textContent || '')) || '').trim();
+      if (re.test(label) && (await h.isVisible().catch(() => false))) {
+        await h.scrollIntoViewIfNeeded().catch(() => {});
+        if (await h.click({ timeout: 5000 }).then(() => true).catch(() => false)) return true;
+      }
+    }
+    await page.waitForTimeout(600);
+  }
+  return false;
 }
 
 async function run() {
   const browser = await chromium.launch({ headless: HEADLESS });
   const ctx = await browser.newContext({
     locale: 'it-IT',
+    timezoneId: 'Europe/Rome',
     viewport: { width: 1440, height: 1000 },
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -72,85 +140,104 @@ async function run() {
   const page = await ctx.newPage();
 
   try {
+    // --- Stage 1: load ------------------------------------------------------
     log('Opening', URL);
     await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(5000);
     await dismissOverlays(page);
+    await snap(page, '01-loaded');
 
-    // --- Step 1: passengers -------------------------------------------------
-    // The form silently drops the passenger count if the modal is confirmed too
-    // early, so we verify it stuck and retry before moving on.
-    let passengersSet = false;
-    for (let attempt = 1; attempt <= 3 && !passengersSet; attempt++) {
+    // --- Stage 2: passengers ------------------------------------------------
+    let ok = false;
+    for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
       log(`Setting passengers (attempt ${attempt})`);
-      await clickByText(page, 'a', /seleziona passeggeri/i);
+      await clickText(page, 'a', /seleziona passeggeri/i, 10000);
       await page.waitForTimeout(2500);
-
       await page.selectOption('#adult', ADULTS).catch(() => {});
-      await page.waitForTimeout(800);
-
-      await clickByText(page, 'input, button', /conferma selezione/i);
+      await page.waitForTimeout(1000);
+      await clickInput(page, /conferma selezione/i, 10000);
       await page.waitForTimeout(3000);
-
-      passengersSet = await page.evaluate(() => {
-        const t = document.body.innerText;
-        return /Adulto/.test(t) && !/Nessuna sistemazione selezionata/.test(t);
-      });
-      if (!passengersSet) await dismissOverlays(page);
+      await dismissOverlays(page);
+      ok = await page.evaluate(() =>
+        /Adulto/.test(document.body.innerText) &&
+        !/Nessuna sistemazione selezionata/.test(document.body.innerText));
     }
-    if (!passengersSet) log('WARN: passenger count may not have registered; continuing anyway.');
+    await snap(page, '02-passengers');
+    if (!ok) throw new Error('Passenger count would not stick after 3 attempts (stage 2).');
 
-    // --- Step 2: run the search --------------------------------------------
+    // --- Stage 3: search ----------------------------------------------------
     log('Running search');
-    await clickByText(page, 'input, button', /^ricerca$/i);
-    await page.waitForTimeout(7000);
+    if (!await clickInput(page, /^ricerca$/i, 15000)) {
+      throw new Error('Could not find the "Ricerca" search button (stage 3).');
+    }
+    await page.waitForTimeout(3000);
     await dismissOverlays(page);
 
-    // --- Step 3: pick our sailing ------------------------------------------
+    // The results only exist once this heading appears. Do not proceed blindly.
+    if (!await waitForText(page, /Risultati della ricerca|Risultati/i, 35000)) {
+      await snap(page, '03-search-FAILED');
+      throw new Error(
+        'Search ran but no results appeared (stage 3). ' +
+        'Check debug/03-search-FAILED.txt — the site may have shown a validation ' +
+        'popup, or there may be no sailing on this date.'
+      );
+    }
+    await dismissOverlays(page);
+    await snap(page, '03-results');
+
+    // --- Stage 4: pick our sailing -----------------------------------------
     log('Selecting sailing', DAY_LABEL);
-    const picked = await page.evaluate((label) => {
-      const norm = s => s.replace(/\s+/g, ' ').trim().toUpperCase();
-      const target = norm(label);
-      const nodes = [...document.querySelectorAll('a, div, li')];
-      const card = nodes.find(n => norm(n.textContent).startsWith(target) ||
-                                   norm(n.textContent).includes(' ' + target + ' '));
-      if (!card) return false;
-      const clickable = card.closest('a') || card.querySelector('a') || card;
-      clickable.click();
-      return true;
-    }, DAY_LABEL);
-    if (!picked) throw new Error(`Could not find a result card for "${DAY_LABEL}"`);
+    const dayRe = new RegExp(DAY_LABEL.replace(/\s+/g, '\\s*'), 'i');
+    let selected = await clickText(page, 'a', dayRe, 15000);
+    if (!selected) selected = await clickText(page, 'div, li', dayRe, 8000);
+    if (!selected) {
+      await snap(page, '04-sailing-FAILED');
+      throw new Error(`No result card matching "${DAY_LABEL}" (stage 4). See debug/04-sailing-FAILED.txt.`);
+    }
     await page.waitForTimeout(2500);
-
-    await clickByText(page, 'input, button', /^prosegui$/i);
-    await page.waitForTimeout(6000);
     await dismissOverlays(page);
+    await snap(page, '04-sailing-selected');
 
-    // --- Step 4: open the accommodations page ------------------------------
+    // --- Stage 5: continue to the quote page --------------------------------
+    log('Continuing to quote');
+    if (!await clickInput(page, /^prosegui$/i, 20000)) {
+      await snap(page, '05-prosegui-FAILED');
+      throw new Error('Could not find the "Prosegui" button (stage 5). See debug/05-prosegui-FAILED.png.');
+    }
+    if (!await waitForText(page, /SELEZIONE PREVENTIVO|sistemazioni e servizi/i, 35000)) {
+      await snap(page, '05-quote-FAILED');
+      throw new Error('Clicked Prosegui but the quote page never loaded (stage 5).');
+    }
+    await snap(page, '05-quote');
+
+    // --- Stage 6: open accommodations ---------------------------------------
     log('Opening accommodations');
-    await clickByText(page, 'a, input, button', /scegli sistemazioni/i, { timeout: 25000 });
-    await page.waitForTimeout(7000);
+    if (!await clickText(page, 'a, button, input', /scegli sistemazioni/i, 25000)) {
+      await snap(page, '06-open-FAILED');
+      throw new Error('Could not find "Scegli sistemazioni e servizi di bordo" (stage 6).');
+    }
+    if (!await waitForText(page, /SISTEMAZIONI DISPONIBILI/i, 40000)) {
+      await snap(page, '06-accommodations-FAILED');
+      throw new Error('Accommodations page never rendered (stage 6).');
+    }
+    await page.waitForTimeout(2500);
+    await snap(page, '06-accommodations');
 
-    // --- Step 5: read what is on offer -------------------------------------
+    // --- Stage 7: read what is offered --------------------------------------
     const offered = await page.evaluate(() => {
-      const heading = [...document.querySelectorAll('a, h1, h2, h3, div')]
-        .find(e => /SISTEMAZIONI DISPONIBILI/i.test(e.textContent) && e.textContent.length < 120);
-      const scope = heading ? (heading.closest('form') || document.body) : document.body;
-      const known = /(poltrona|passaggio ponte|cabina|poltrona vip)/i;
-      const names = [...scope.querySelectorAll('a, span, div, label')]
-        .filter(e => e.children.length === 0)
-        .map(e => e.textContent.replace(/\s+/g, ' ').trim())
-        .filter(t => t.length > 2 && t.length < 80 && known.test(t));
-      return [...new Set(names)];
+      const known = /(poltrona|passaggio ponte|cabina|suite)/i;
+      return [...new Set(
+        [...document.querySelectorAll('a, span, div, label, li')]
+          .filter(e => e.children.length === 0)
+          .map(e => e.textContent.replace(/\s+/g, ' ').trim())
+          .filter(t => t.length > 2 && t.length < 80 && known.test(t))
+      )];
     });
 
     log('Offered accommodations:', JSON.stringify(offered));
+    if (!offered.length) throw new Error('Reached accommodations but read no options (stage 7).');
 
-    if (!offered.length) {
-      throw new Error('Reached the accommodations step but read no options — selectors may need updating.');
-    }
-
-    const cabins = offered.filter(o => /cabina/i.test(o));
+    const cabins = offered.filter(o => /cabina|suite/i.test(o));
     if (cabins.length) {
       await notify(
         `🚢 <b>CABIN AVAILABLE</b>\n\n` +
@@ -163,12 +250,12 @@ async function run() {
     }
   } catch (err) {
     log('ERROR:', err.message);
-    await page.screenshot({ path: 'failure.png', fullPage: true }).catch(() => {});
-    // Alert on breakage too — a silently broken watcher is worse than none.
-    await notify(
-      `⚠️ Grimaldi cabin watcher failed for ${DAY_LABEL}.\n\n` +
-      `${err.message}\n\nWorth checking the page manually:\n${URL}`
-    );
+    await snap(page, '99-failure');
+    if (ALERT_ON_FAILURE) {
+      await notify(`⚠️ Grimaldi cabin watcher failed for ${DAY_LABEL}.\n\n${err.message}`);
+    } else {
+      log('(failure alert suppressed — GitHub emails you about failed runs)');
+    }
     process.exitCode = 1;
   } finally {
     await browser.close();
