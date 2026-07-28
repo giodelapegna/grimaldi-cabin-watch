@@ -246,7 +246,7 @@ async function run() {
     log('Offered accommodations:', JSON.stringify(offered));
     if (!offered.length) throw new Error('Reached accommodations but read no options (stage 7).');
 
-    const cabins = offered.filter(o => /cabina|suite/i(o));
+    const cabins = offered.filter(o => /cabina|suite/i.test(o));
     if (cabins.length) {
       await notify(
         `🚢 <b>CABIN AVAILABLE</b>\n\n` +
