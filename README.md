@@ -1,5 +1,3 @@
-# grimaldi-cabin-watch
-
 # Grimaldi cabin watch — complete setup guide
 
 **What this does:** every 30 minutes, a robot checks the Grimaldi Lines website
@@ -348,7 +346,9 @@ already have.
 
 The robot now checks roughly every 30 minutes, day and night, on its own.
 
-- **No cabin?** Silence. It says nothing. No news is no cabin.
+- **No cabin?** One short "still watching" message each morning, and silence
+  otherwise. If that morning message does not arrive, treat it as a warning
+  sign and open the Actions tab.
 - **Cabin appears?** Your phone buzzes with the cabin name and a reminder to call.
   Call Grimaldi straight away — as you saw on 3 September, these get taken fast.
 - **Robot breaks?** It messages you about that too. This is deliberate: a watcher
@@ -376,8 +376,9 @@ the pencil icon and commit.
 
 | To change | Find this line | Change it to |
 |---|---|---|
-| Check less often (hourly) | `- cron: '*/30 * * * *'` | `- cron: '0 * * * *'` |
-| Check more often (15 min) | `- cron: '*/30 * * * *'` | `- cron: '*/15 * * * *'` |
+| Check more often | `INTERVAL_MINUTES: '60'` | e.g. `'30'` or `'15'` |
+| Move the heartbeat | `HEARTBEAT_HOUR: '5'` | UTC hour; `'5'` = ~07:00 Dutch time |
+| Turn the heartbeat off | `HEARTBEAT_HOUR: '5'` | `HEARTBEAT_HOUR: '-1'` |
 | A different date | `DATE: '06092026'` | e.g. `DATE: '10092026'` (ddmmyyyy) |
 | ...and its card label | `DAY_LABEL: '6 SET'` | e.g. `DAY_LABEL: '10 SET'` |
 | Number of people | `ADULTS: '2'` | e.g. `ADULTS: '3'` |
