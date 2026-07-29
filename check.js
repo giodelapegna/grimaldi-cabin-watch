@@ -21,6 +21,15 @@ const DATE = process.env.DATE || '06092026';
 const DAY_LABEL = process.env.DAY_LABEL || '6 SET';
 const ADULTS = process.env.ADULTS || '2';
 const HEADLESS = process.env.HEADLESS !== 'false';
+// One run keeps checking for LOOP_MINUTES, pausing INTERVAL_MINUTES between
+// passes. GitHub often drops scheduled triggers, so we lean on the trigger as
+// little as possible: one trigger that survives still buys several checks.
+const LOOP_MINUTES = Number(process.env.LOOP_MINUTES || 0);
+const INTERVAL_MINUTES = Number(process.env.INTERVAL_MINUTES || 60);
+// Hour (UTC) at which the daily "still watching" message is sent, so that
+// silence becomes meaningful: no heartbeat by mid-morning means something is
+// wrong. Set to -1 to switch the heartbeat off.
+const HEARTBEAT_HOUR = Number(process.env.HEARTBEAT_HOUR ?? -1);
 const ALERT_ON_FAILURE = process.env.ALERT_ON_FAILURE === 'true';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -136,7 +145,7 @@ async function clickInput(page, re, timeout = 15000) {
   return false;
 }
 
-async function run() {
+async function checkOnce() {
   const browser = await chromium.launch({ headless: HEADLESS });
   const ctx = await browser.newContext({
     locale: 'it-IT',
@@ -147,6 +156,9 @@ async function run() {
       '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
   });
   const page = await ctx.newPage();
+  let found = false;
+  let failed = false;
+  let lastOffered = [];
 
   try {
     // --- Stage 1: load ------------------------------------------------------
@@ -244,10 +256,12 @@ async function run() {
     });
 
     log('Offered accommodations:', JSON.stringify(offered));
+    lastOffered = offered;
     if (!offered.length) throw new Error('Reached accommodations but read no options (stage 7).');
 
     const cabins = offered.filter(o => /cabina|suite/i.test(o));
     if (cabins.length) {
+      found = true;
       await notify(
         `🚢 <b>CABIN AVAILABLE</b>\n\n` +
         `Cagliari → Napoli, ${DAY_LABEL} (${ADULTS} adults)\n\n` +
@@ -265,10 +279,59 @@ async function run() {
     } else {
       log('(failure alert suppressed — GitHub emails you about failed runs)');
     }
-    process.exitCode = 1;
+    failed = true;
   } finally {
     await browser.close();
   }
+  return { found, failed, offered: lastOffered };
 }
 
-run();
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function main() {
+  const deadline = Date.now() + LOOP_MINUTES * 60000;
+  let pass = 0;
+  let lastFailed = false;
+
+  while (true) {
+    pass++;
+    if (LOOP_MINUTES > 0) log(`--- pass ${pass} ---`);
+
+    const { found, failed, offered } = await checkOnce();
+    lastFailed = failed;
+
+    // Daily heartbeat, on the first pass of whichever run starts in the
+    // heartbeat window. Only one run per day begins in that window, so this
+    // fires once. The +2h tolerance covers a trigger that GitHub delayed.
+    if (pass === 1 && HEARTBEAT_HOUR >= 0) {
+      const h = new Date().getUTCHours();
+      if (h >= HEARTBEAT_HOUR && h <= HEARTBEAT_HOUR + 2) {
+        const status = failed
+          ? `⚠️ last check did not complete — see the GitHub run log`
+          : `Latest check: ${offered.length ? offered.join(', ') : 'nothing read'}`;
+        await notify(
+          `☕ <b>Still watching</b>\n\n` +
+          `Cagliari → Napoli, ${DAY_LABEL} (${ADULTS} adults)\n` +
+          `${status}\n\n` +
+          `No cabin yet — you will be messaged the moment one appears.`
+        );
+      }
+    }
+
+    // Stop as soon as a cabin turns up: you have been told, and repeating the
+    // same alert every 15 minutes would be noise.
+    if (found) {
+      log('Cabin found — stopping this run.');
+      break;
+    }
+    if (Date.now() + INTERVAL_MINUTES * 60000 >= deadline) break;
+
+    log(`Sleeping ${INTERVAL_MINUTES} min before the next pass.`);
+    await sleep(INTERVAL_MINUTES * 60000);
+  }
+
+  log(`Finished after ${pass} pass(es).`);
+  if (lastFailed) process.exitCode = 1;   // surface only a trailing failure
+}
+
+main();
