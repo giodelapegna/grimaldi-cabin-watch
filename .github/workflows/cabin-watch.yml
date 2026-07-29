@@ -2,25 +2,37 @@ name: Grimaldi cabin watch
 
 on:
   schedule:
-    # Every 30 minutes. GitHub may delay scheduled runs under load,
-    # so treat this as "roughly every 30-45 min", not a guarantee.
-    - cron: '*/30 * * * *'
+    # Four triggers a day at :07 past the hour, deliberately NOT :00 or :30 --
+    # GitHub's docs warn that the top of the hour is a high-load window where
+    # scheduled runs get delayed or silently dropped.
+    #
+    # Each triggered run then keeps checking for 5 hours (LOOP_MINUTES), so the
+    # day is covered by only four triggers instead of twenty-four. Fewer
+    # triggers to depend on = far less exposure to GitHub dropping them.
+    #
+    # Times are UTC. In the Netherlands (summer, UTC+2) these start at
+    # 07:07, 13:07, 19:07 and 01:07 local.
+    - cron: '7 5,11,17,23 * * *'
   workflow_dispatch: {}   # lets you trigger a check by hand
 
 concurrency:
   group: cabin-watch
-  cancel-in-progress: false
+  cancel-in-progress: true   # a fresh run supersedes one still looping
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 330
 
     env:
       ROUTE: ITCAG-ITNAP        # Cagliari -> Napoli
       DATE: '06092026'          # ddmmyyyy
       DAY_LABEL: '6 SET'        # label on the result card
       ADULTS: '2'
+      LOOP_MINUTES: '300'       # each run keeps checking for 5 hours
+      INTERVAL_MINUTES: '60'    # ...with one check per hour (5 per run)
+      HEARTBEAT_HOUR: '5'       # daily "still watching" message, 05:xx UTC
+                                # = ~07:00 Dutch time. Set to -1 to disable.
       # Keep this 'false'. GitHub emails you when a run fails, so there is no
       # need to also buzz your phone every 30 minutes while something is broken.
       ALERT_ON_FAILURE: 'false'
